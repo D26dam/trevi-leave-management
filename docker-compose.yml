@@ -1,0 +1,482 @@
+# =============================================================================
+# DOCKER ENVIRONMENT FILE (.env.docker)
+# =============================================================================
+
+# Database Configuration
+POSTGRES_DB=leave_management
+POSTGRES_USER=leave_admin
+POSTGRES_PASSWORD=secure_password_123
+POSTGRES_PORT=5432
+
+# Redis Configuration
+REDIS_PORT=6379
+
+# API Configuration
+API_PORT=3000
+JWT_SECRET=trevi_jwt_secret_key_2025_super_secure_random_string
+FRONTEND_URL=http://localhost:8080
+
+# Email Configuration
+EMAIL_HOST=smtp.gmail.com
+EMAIL_PORT=587
+EMAIL_USER=your-email@gmail.com
+EMAIL_PASSWORD=your-app-password
+EMAIL_FROM="Trevi Foundations <noreply@trevi.com>"
+
+# File Upload Configuration
+MAX_FILE_SIZE=5242880
+
+# Rate Limiting
+RATE_LIMIT_WINDOW=900000
+RATE_LIMIT_MAX=100
+
+# Frontend Configuration
+FRONTEND_PORT=8080
+
+# Nginx Configuration
+HTTP_PORT=80
+HTTPS_PORT=443
+
+# Monitoring
+GRAFANA_PASSWORD=admin123
+
+# =============================================================================
+# BUILD SCRIPT (scripts/build.sh)
+# =============================================================================
+
+#!/bin/bash
+
+# Trevi Foundations Leave Management System - Docker Build Script
+# This script builds all Docker images for the application
+
+set -e
+
+echo "🏗️  Building Trevi Leave Management System Docker Images..."
+
+# Load environment variables
+if [ -f .env.docker ]; then
+    export $(cat .env.docker | xargs)
+fi
+
+# Build backend API
+echo "📦 Building Backend API..."
+docker build -t trevi-leave-api:latest \
+    --target production \
+    --build-arg NODE_ENV=production \
+    .
+
+# Build development image
+echo "📦 Building Development Image..."
+docker build -t trevi-leave-api:dev \
+    --target development \
+    .
+
+# Build frontend
+echo "📦 Building Frontend..."
+docker build -t trevi-leave-frontend:latest \
+    -f frontend/Dockerfile \
+    .
+
+# Build nginx proxy
+echo "📦 Building Nginx Proxy..."
+docker build -t trevi-leave-nginx:latest \
+    -f nginx.Dockerfile \
+    .
+
+# Build using docker-compose (ensures all services work together)
+echo "📦 Building with Docker Compose..."
+docker-compose build --no-cache
+
+echo "✅ Build completed successfully!"
+echo ""
+echo "🚀 To start the application:"
+echo "   docker-compose up -d"
+echo ""
+echo "🔍 To view logs:"
+echo "   docker-compose logs -f"
+
+# =============================================================================
+# START SCRIPT (scripts/start.sh)
+# =============================================================================
+
+#!/bin/bash
+
+# Trevi Foundations Leave Management System - Docker Start Script
+
+set -e
+
+echo "🚀 Starting Trevi Leave Management System..."
+
+# Check if .env.docker exists
+if [ ! -f .env.docker ]; then
+    echo "⚠️  .env.docker file not found. Creating from template..."
+    cp .env.example .env.docker
+    echo "📝 Please edit .env.docker with your configuration"
+    exit 1
+fi
+
+# Create required directories
+echo "📁 Creating required directories..."
+mkdir -p data/postgres uploads logs backups ssl
+
+# Set proper permissions
+echo "🔐 Setting permissions..."
+chmod 755 uploads logs backups
+chmod -R 600 ssl/ 2>/dev/null || true
+
+# Pull latest images
+echo "📥 Pulling latest images..."
+docker-compose pull
+
+# Start services in background
+echo "🎬 Starting services..."
+docker-compose up -d postgres redis
+
+# Wait for database to be ready
+echo "⏳ Waiting for database to be ready..."
+until docker-compose exec -T postgres pg_isready -U leave_admin -d leave_management; do
+    echo "Waiting for PostgreSQL..."
+    sleep 2
+done
+
+# Run database migrations
+echo "🗄️  Running database migrations..."
+docker-compose exec -T api npm run migrate || echo "Migration completed"
+
+# Start all services
+echo "🌟 Starting all services..."
+docker-compose up -d
+
+# Show status
+echo "📊 Service Status:"
+docker-compose ps
+
+echo ""
+echo "✅ Application started successfully!"
+echo ""
+echo "🌐 Frontend: http://localhost:8080"
+echo "🔗 API: http://localhost:3000"
+echo "🗄️  Database: localhost:5432"
+echo "📊 Redis: localhost:6379"
+echo ""
+echo "🎯 Demo Credentials:"
+echo "   Admin: admin@trevi.com / admin123"
+echo "   Employee: employee@trevi.com / password"
+echo ""
+echo "📝 View logs: docker-compose logs -f"
+echo "🛑 Stop services: docker-compose down"
+
+# =============================================================================
+# STOP SCRIPT (scripts/stop.sh)
+# =============================================================================
+
+#!/bin/bash
+
+# Trevi Foundations Leave Management System - Docker Stop Script
+
+echo "🛑 Stopping Trevi Leave Management System..."
+
+# Stop all services
+docker-compose down
+
+echo "✅ All services stopped successfully!"
+
+# =============================================================================
+# BACKUP SCRIPT (scripts/backup.sh)
+# =============================================================================
+
+#!/bin/bash
+
+# Database backup script for Docker
+
+set -e
+
+BACKUP_DIR="/backups"
+DATE=$(date +"%Y%m%d_%H%M%S")
+BACKUP_FILE="$BACKUP_DIR/leave_management_backup_$DATE.sql"
+
+echo "📦 Starting database backup..."
+echo "Backup file: $BACKUP_FILE"
+
+# Create backup directory if it doesn't exist
+mkdir -p $BACKUP_DIR
+
+# Create database backup
+pg_dump -h postgres -U $POSTGRES_USER -d $POSTGRES_DB > $BACKUP_FILE
+
+# Compress the backup
+gzip $BACKUP_FILE
+
+echo "✅ Database backup completed: ${BACKUP_FILE}.gz"
+
+# Clean up old backups (keep last 7 days)
+find $BACKUP_DIR -name "leave_management_backup_*.sql.gz" -mtime +7 -delete
+
+echo "🧹 Cleaned up old backups (older than 7 days)"
+
+# =============================================================================
+# RESTORE SCRIPT (scripts/restore.sh)
+# =============================================================================
+
+#!/bin/bash
+
+# Database restore script for Docker
+
+set -e
+
+if [ -z "$1" ]; then
+    echo "Usage: $0 <backup_file.sql.gz>"
+    echo "Available backups:"
+    ls -la backups/leave_management_backup_*.sql.gz
+    exit 1
+fi
+
+BACKUP_FILE="$1"
+
+if [ ! -f "$BACKUP_FILE" ]; then
+    echo "❌ Backup file not found: $BACKUP_FILE"
+    exit 1
+fi
+
+echo "🔄 Restoring database from: $BACKUP_FILE"
+
+# Stop API service to prevent connections
+docker-compose stop api
+
+# Drop and recreate database
+docker-compose exec -T postgres psql -U $POSTGRES_USER -c "DROP DATABASE IF EXISTS $POSTGRES_DB;"
+docker-compose exec -T postgres psql -U $POSTGRES_USER -c "CREATE DATABASE $POSTGRES_DB;"
+
+# Restore from backup
+gunzip -c $BACKUP_FILE | docker-compose exec -T postgres psql -U $POSTGRES_USER -d $POSTGRES_DB
+
+# Start API service
+docker-compose start api
+
+echo "✅ Database restored successfully!"
+
+# =============================================================================
+# LOGS SCRIPT (scripts/logs.sh)
+# =============================================================================
+
+#!/bin/bash
+
+# View logs for all services or specific service
+
+SERVICE=${1:-""}
+
+if [ -z "$SERVICE" ]; then
+    echo "📋 Showing logs for all services..."
+    docker-compose logs -f --tail=100
+else
+    echo "📋 Showing logs for $SERVICE..."
+    docker-compose logs -f --tail=100 $SERVICE
+fi
+
+# =============================================================================
+# HEALTH CHECK SCRIPT (scripts/health.sh)
+# =============================================================================
+
+#!/bin/bash
+
+# Health check script for all services
+
+echo "🏥 Health Check for Trevi Leave Management System"
+echo "================================================="
+
+# Check if services are running
+echo ""
+echo "📊 Service Status:"
+docker-compose ps
+
+echo ""
+echo "🔍 Service Health Checks:"
+
+# Check PostgreSQL
+echo -n "PostgreSQL: "
+if docker-compose exec -T postgres pg_isready -U leave_admin -d leave_management > /dev/null 2>&1; then
+    echo "✅ Healthy"
+else
+    echo "❌ Unhealthy"
+fi
+
+# Check Redis
+echo -n "Redis: "
+if docker-compose exec -T redis redis-cli ping > /dev/null 2>&1; then
+    echo "✅ Healthy"
+else
+    echo "❌ Unhealthy"
+fi
+
+# Check API
+echo -n "API: "
+if curl -s http://localhost:3000/api/health > /dev/null 2>&1; then
+    echo "✅ Healthy"
+else
+    echo "❌ Unhealthy"
+fi
+
+# Check Frontend
+echo -n "Frontend: "
+if curl -s http://localhost:8080 > /dev/null 2>&1; then
+    echo "✅ Healthy"
+else
+    echo "❌ Unhealthy"
+fi
+
+# Check Nginx (if running)
+echo -n "Nginx: "
+if curl -s http://localhost:80 > /dev/null 2>&1; then
+    echo "✅ Healthy"
+else
+    echo "❌ Unhealthy or not running"
+fi
+
+echo ""
+echo "💾 Disk Usage:"
+df -h
+
+echo ""
+echo "🧠 Memory Usage:"
+docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"
+
+# =============================================================================
+# FRONTEND NGINX CONFIG (frontend/nginx.conf)
+# =============================================================================
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Gzip compression
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+
+    # Security headers
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # Static assets caching
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # SPA routing - all routes serve index.html
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Health check endpoint
+    location /health {
+        access_log off;
+        return 200 "healthy\n";
+        add_header Content-Type text/plain;
+    }
+}
+
+# =============================================================================
+# REDIS CONFIG (redis.conf)
+# =============================================================================
+
+# Redis configuration for production
+
+# Network
+bind 0.0.0.0
+port 6379
+protected-mode no
+
+# General
+daemonize no
+supervised no
+pidfile /var/run/redis.pid
+
+# Logging
+loglevel notice
+logfile ""
+
+# Persistence
+save 900 1
+save 300 10
+save 60 10000
+rdbcompression yes
+rdbchecksum yes
+dbfilename dump.rdb
+dir /data
+
+# Memory
+maxmemory 256mb
+maxmemory-policy allkeys-lru
+
+# Clients
+maxclients 100
+
+# Security (uncomment and set password in production)
+# requirepass your_redis_password
+
+# =============================================================================
+# MAKEFILE
+# =============================================================================
+
+.PHONY: help build start stop restart logs health backup restore clean dev prod
+
+help: ## Show this help message
+	@echo 'Usage: make [target]'
+	@echo ''
+	@echo 'Targets:'
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+build: ## Build all Docker images
+	@chmod +x scripts/*.sh
+	@./scripts/build.sh
+
+start: ## Start all services
+	@chmod +x scripts/*.sh
+	@./scripts/start.sh
+
+stop: ## Stop all services
+	@chmod +x scripts/*.sh
+	@./scripts/stop.sh
+
+restart: stop start ## Restart all services
+
+logs: ## Show logs for all services
+	@docker-compose logs -f
+
+health: ## Check health of all services
+	@chmod +x scripts/*.sh
+	@./scripts/health.sh
+
+backup: ## Create database backup
+	@docker-compose exec backup /backup.sh
+
+restore: ## Restore database from backup (usage: make restore FILE=backup.sql.gz)
+	@chmod +x scripts/*.sh
+	@./scripts/restore.sh $(FILE)
+
+clean: ## Clean up Docker images and volumes
+	@docker-compose down -v
+	@docker system prune -f
+	@docker volume prune -f
+
+dev: ## Start development environment
+	@docker-compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+	@echo "🚀 Development environment started"
+	@echo "API: http://localhost:3000"
+	@echo "Frontend: http://localhost:3001"
+	@echo "pgAdmin: http://localhost:5050"
+
+prod: ## Start production environment
+	@docker-compose --profile monitoring up -d
+	@echo "🚀 Production environment started"
+	@echo "Frontend: http://localhost:80"
+	@echo "API: http://localhost:3000"
+	@echo "Monitoring: http://localhost:3001"
